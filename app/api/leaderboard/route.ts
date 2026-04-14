@@ -1,6 +1,6 @@
 // GET /api/leaderboard
 import { NextRequest, NextResponse } from "next/server";
-import { getLeaderboard } from "../../../lib/db/client";
+import { getLeaderboard } from "@/lib/db/client";
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);

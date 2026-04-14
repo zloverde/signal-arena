@@ -2,8 +2,8 @@
 // Full platform overview for admin dashboard
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireAdmin } from "../../../lib/auth";
-import { getRounds, getLeaderboard, db } from "../../../lib/db/client";
+import { requireAdmin } from "@/lib/auth";
+import { getRounds, getLeaderboard, db } from "@/lib/db/client";
 
 export async function GET(req: NextRequest) {
   const adminError = requireAdmin(req);

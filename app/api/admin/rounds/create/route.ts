@@ -2,15 +2,15 @@
 // Admin creates a new round with auto-generated signals
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireAdmin } from "../../../../lib/auth";
-import { createRound, insertSignals, logAdminEvent, db } from "../../../../lib/db/client";
+import { requireAdmin } from "@/lib/auth";
+import { createRound, insertSignals, logAdminEvent, db } from "@/lib/db/client";
 import {
   sampleRegime,
   sampleTheta,
   generateRoundSignals,
   validateRound,
-} from "../../../../lib/engine/signal-engine";
-import type { Regime } from "../../../../types/index";
+} from "@/lib/engine/signal-engine";
+import type { Regime } from "@/types/index";
 
 export async function POST(req: NextRequest) {
   const adminError = requireAdmin(req);

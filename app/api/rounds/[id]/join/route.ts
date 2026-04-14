@@ -1,6 +1,6 @@
 // POST /api/rounds/:id/join
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateAgent } from "../../../../../lib/auth";
+import { authenticateAgent } from "@/lib/auth";
 import {
   getRoundById,
   getPrivateSignalsForAgent,
@@ -9,7 +9,7 @@ import {
   addToPrizePool,
   assignPrivateSignals,
   db,
-} from "../../../../../lib/db/client";
+} from "@/lib/db/client";
 
 function stripHidden(signal: any) {
   const { hidden_reliability, is_trap, ...safe } = signal;
@@ -18,13 +18,14 @@ function stripHidden(signal: any) {
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const authResult = await authenticateAgent(req);
   if (authResult instanceof NextResponse) return authResult;
   const { agent } = authResult;
 
-  const round = await getRoundById(params.id);
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }
@@ -36,7 +37,7 @@ export async function POST(
   }
 
   // Check if already joined
-  const existing = await getPrivateSignalsForAgent(params.id, agent.id);
+  const existing = await getPrivateSignalsForAgent(id, agent.id);
   if (existing.length > 0) {
     return NextResponse.json({
       message: "Already joined this round",
@@ -58,13 +59,13 @@ export async function POST(
 
   await adjustWalletBalance(wallet.id, -round.entry_fee);
   const platformCut = round.entry_fee * round.platform_fee_pct;
-  await addToPrizePool(params.id, round.entry_fee - platformCut);
+  await addToPrizePool(id, round.entry_fee - platformCut);
 
   // Assign private signals
   const { data: privatePool } = await db
     .from("signals")
     .select("id")
-    .eq("round_id", params.id)
+    .eq("round_id", id)
     .eq("visibility", "private");
 
   if (!privatePool || privatePool.length < 2) {
@@ -75,7 +76,7 @@ export async function POST(
   const { data: existingCount } = await db
     .from("private_signal_assignments")
     .select("agent_id")
-    .eq("round_id", params.id);
+    .eq("round_id", id);
 
   const agentIndex = new Set((existingCount || []).map((a: any) => a.agent_id)).size;
   const poolSize = privatePool.length;
@@ -87,13 +88,13 @@ export async function POST(
     privatePool[Math.min(idx2, poolSize - 1)].id,
   ];
 
-  await assignPrivateSignals(params.id, agent.id, signalIds);
-  const privateSignals = await getPrivateSignalsForAgent(params.id, agent.id);
+  await assignPrivateSignals(id, agent.id, signalIds);
+  const privateSignals = await getPrivateSignalsForAgent(id, agent.id);
 
   return NextResponse.json({
     message: "Joined round successfully",
     entry_fee_paid: round.entry_fee,
     private_signals: privateSignals.map(stripHidden),
-    next_step: `Submit your probability estimate via POST /api/rounds/${params.id}/submit`,
+    next_step: `Submit your probability estimate via POST /api/rounds/${id}/submit`,
   });
 }

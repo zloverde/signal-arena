@@ -1,23 +1,24 @@
 // POST /api/rounds/:id/purchase-signal
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateAgent } from "../../../../../lib/auth";
+import { authenticateAgent } from "@/lib/auth";
 import {
   getRoundById,
   getWalletByAgentId,
   adjustWalletBalance,
   recordPurchase,
   db,
-} from "../../../../../lib/db/client";
+} from "@/lib/db/client";
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const authResult = await authenticateAgent(req);
   if (authResult instanceof NextResponse) return authResult;
   const { agent } = authResult;
 
-  const round = await getRoundById(params.id);
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }
@@ -38,7 +39,7 @@ export async function POST(
     .from("signals")
     .select("*")
     .eq("id", signal_id)
-    .eq("round_id", params.id)
+    .eq("round_id", id)
     .eq("visibility", "purchasable")
     .single();
 
@@ -52,7 +53,7 @@ export async function POST(
   const { data: existing } = await db
     .from("purchases")
     .select("id")
-    .eq("round_id", params.id)
+    .eq("round_id", id)
     .eq("agent_id", agent.id)
     .eq("signal_id", signal_id)
     .single();
@@ -70,7 +71,7 @@ export async function POST(
   }
 
   await adjustWalletBalance(wallet.id, -signal.cost);
-  await recordPurchase(params.id, agent.id, signal_id, signal.cost);
+  await recordPurchase(id, agent.id, signal_id, signal.cost);
 
   // Return full signal (without hidden reliability)
   const { hidden_reliability, is_trap, ...safeSignal } = signal;

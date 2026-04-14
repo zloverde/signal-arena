@@ -1,6 +1,6 @@
 // POST /api/rounds/:id/submit
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateAgent } from "../../../../../lib/auth";
+import { authenticateAgent } from "@/lib/auth";
 import {
   getRoundById,
   getPrivateSignalsForAgent,
@@ -9,17 +9,18 @@ import {
   adjustWalletBalance,
   addToPrizePool,
   submitEntry,
-} from "../../../../../lib/db/client";
+} from "@/lib/db/client";
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const authResult = await authenticateAgent(req);
   if (authResult instanceof NextResponse) return authResult;
   const { agent } = authResult;
 
-  const round = await getRoundById(params.id);
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }
@@ -31,7 +32,7 @@ export async function POST(
   }
 
   // Must have joined first
-  const privateSignals = await getPrivateSignalsForAgent(params.id, agent.id);
+  const privateSignals = await getPrivateSignalsForAgent(id, agent.id);
   if (privateSignals.length === 0) {
     return NextResponse.json(
       { error: "Must join round first. POST /api/rounds/:id/join" },
@@ -40,7 +41,7 @@ export async function POST(
   }
 
   // No duplicate submissions
-  const existing = await getAgentEntry(params.id, agent.id);
+  const existing = await getAgentEntry(id, agent.id);
   if (existing) {
     return NextResponse.json(
       { error: "Already submitted for this round" },
@@ -83,9 +84,9 @@ export async function POST(
 
   await adjustWalletBalance(wallet.id, -stake);
   const platformCut = stake * round.platform_fee_pct;
-  await addToPrizePool(params.id, stake - platformCut);
+  await addToPrizePool(id, stake - platformCut);
 
-  const entry = await submitEntry(params.id, agent.id, probability_estimate, stake, 0);
+  const entry = await submitEntry(id, agent.id, probability_estimate, stake, 0);
 
   return NextResponse.json({
     message: "Submission accepted",

@@ -1,567 +1,387 @@
-// ============================================================
-// Signal Arena — Signal Engine
-// ============================================================
-// This is the core intelligence of the platform. It generates
-// structured uncertainty: not random noise, not solved puzzles.
-//
-// Key invariants:
-//   - Strong agents extract real edge by inferring regime
-//   - Every round has at least 1 useful and 1 misleading signal
-//   - Visible reliability hints are imperfect but informative
-//   - Source reliability shifts across regimes (source drift)
-// ============================================================
+import type { Regime, SourceFamily } from "@/types/index";
 
-import {
+// ---------------------------------------------------------------------------
+// Regime × source base reliabilities (see docs/SIGNAL_ENGINE.md)
+// ---------------------------------------------------------------------------
+
+export const REGIME_SOURCE_RELIABILITY: Record<
   Regime,
-  SourceFamily,
-  SignalVisibility,
-  Signal,
-} from "../types/index";
+  Record<SourceFamily, number>
+> = {
+  stable_trend: {
+    trend: 0.82,
+    fundamental: 0.6,
+    contrarian: 0.25,
+    insider: 0.55,
+    meta_reliability: 0.7,
+  },
+  mean_reversion: {
+    trend: 0.3,
+    fundamental: 0.65,
+    contrarian: 0.78,
+    insider: 0.6,
+    meta_reliability: 0.7,
+  },
+  shock_event: {
+    trend: 0.2,
+    fundamental: 0.72,
+    contrarian: 0.45,
+    insider: 0.85,
+    meta_reliability: 0.65,
+  },
+};
 
-// ============================================================
-// Regime-aware source reliability matrices
-//
-// Each cell is the base reliability of source family given regime.
-// 1.0 = perfect, 0.0 = random, negative = anti-correlated (trap)
-// ============================================================
-const REGIME_SOURCE_RELIABILITY: Record<Regime, Record<SourceFamily, number>> =
-  {
-    stable_trend: {
-      trend: 0.82,
-      fundamental: 0.60,
-      contrarian: 0.25, // underperforms in trends
-      insider: 0.55,
-      meta_reliability: 0.70,
-    },
-    mean_reversion: {
-      trend: 0.30, // overshoots in mean reversion
-      fundamental: 0.65,
-      contrarian: 0.78, // contrarians shine
-      insider: 0.60,
-      meta_reliability: 0.70,
-    },
-    shock_event: {
-      trend: 0.20, // trend degrades in shocks
-      fundamental: 0.72, // fundamentals more useful
-      contrarian: 0.45,
-      insider: 0.85, // insiders know most in shock events
-      meta_reliability: 0.65,
-    },
-  };
-
-// Regime prior probabilities (hidden from agents)
 const REGIME_PRIORS: Record<Regime, number> = {
   stable_trend: 0.45,
   mean_reversion: 0.35,
-  shock_event: 0.20,
+  shock_event: 0.2,
 };
 
-// ============================================================
-// Random utilities
-// ============================================================
+const FAMILY_HASH: Record<SourceFamily, number> = {
+  trend: 1,
+  fundamental: 2,
+  contrarian: 3,
+  insider: 4,
+  meta_reliability: 5,
+};
 
-/** Box-Muller normal sample */
-function randn(): number {
-  let u = 0,
-    v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-}
-
-/** Clamp to [lo, hi] */
 function clamp(x: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, x));
 }
 
-/** Noisy version of a value: add Gaussian noise scaled by noiseLevel */
-function addNoise(value: number, noiseLevel: number): number {
-  return clamp(value + randn() * noiseLevel, 0.01, 0.99);
+function randn(): number {
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
-/** Logistic transform to keep estimates in (0,1) */
-function logistic(x: number): number {
-  return 1 / (1 + Math.exp(-x));
-}
-
-// ============================================================
-// Sample regime from prior
-// ============================================================
 export function sampleRegime(): Regime {
-  const r = Math.random();
-  let cum = 0;
-  for (const [regime, prob] of Object.entries(REGIME_PRIORS)) {
-    cum += prob;
-    if (r < cum) return regime as Regime;
-  }
-  return "stable_trend";
+  const u = Math.random();
+  if (u < REGIME_PRIORS.stable_trend) return "stable_trend";
+  if (u < REGIME_PRIORS.stable_trend + REGIME_PRIORS.mean_reversion) return "mean_reversion";
+  return "shock_event";
 }
 
-// ============================================================
-// Sample theta (true probability) given regime
-// Regimes have different characteristic theta distributions.
-// ============================================================
 export function sampleTheta(regime: Regime): number {
-  // stable_trend: slightly skewed toward higher probabilities
-  // mean_reversion: centered around 0.5
-  // shock_event: bimodal, more extreme
-  let base: number;
-
   if (regime === "stable_trend") {
-    base = 0.55 + randn() * 0.18;
-  } else if (regime === "mean_reversion") {
-    base = 0.50 + randn() * 0.12;
-  } else {
-    // shock_event: bimodal
-    base = Math.random() > 0.5 ? 0.75 + randn() * 0.12 : 0.25 + randn() * 0.12;
+    return clamp(0.55 + randn() * 0.18, 0.05, 0.95);
   }
-
-  return clamp(base, 0.05, 0.95);
+  if (regime === "mean_reversion") {
+    return clamp(0.5 + randn() * 0.12, 0.05, 0.95);
+  }
+  // shock_event: bimodal
+  const branch = Math.random() < 0.5;
+  const base = branch ? 0.75 : 0.25;
+  return clamp(base + randn() * 0.12, 0.05, 0.95);
 }
 
-// ============================================================
-// Apply source drift
-// Source drift shifts reliabilities by a small amount every
-// few rounds, preventing one static strategy from dominating.
-// driftSeed should be updated by the platform every N rounds.
-// ============================================================
-function applySourceDrift(
-  baseReliability: number,
-  driftSeed: number,
-  sourceFamily: SourceFamily
-): number {
-  // Use a deterministic but varying drift per source family
-  const familyHash = sourceFamily
-    .split("")
-    .reduce((acc, c) => acc + c.charCodeAt(0), 0);
-  const drift = Math.sin(driftSeed * 0.37 + familyHash * 0.13) * 0.08;
-  return clamp(baseReliability + drift, 0.05, 0.95);
-}
-
-// ============================================================
-// Generate a single signal
-// ============================================================
-function generateSignal(
-  roundId: string,
-  sourceFamily: SourceFamily,
-  visibility: SignalVisibility,
-  theta: number,
+export function driftedReliability(
   regime: Regime,
-  driftSeed: number,
-  cost: number,
-  isTrap: boolean,
-  index: number
-): Omit<Signal, "id"> {
-  const baseReliability = REGIME_SOURCE_RELIABILITY[regime][sourceFamily];
-  const driftedReliability = applySourceDrift(baseReliability, driftSeed, sourceFamily);
+  family: SourceFamily,
+  driftSeed: number
+): number {
+  const base = REGIME_SOURCE_RELIABILITY[regime][family];
+  const drift =
+    Math.sin(driftSeed * 0.37 + FAMILY_HASH[family] * 0.13) * 0.08;
+  return clamp(base + drift, 0.05, 0.95);
+}
 
-  // Trap signals have inverted reliability — they mislead
-  const effectiveReliability = isTrap
-    ? clamp(1 - driftedReliability, 0.05, 0.95)
-    : driftedReliability;
+function effectiveReliability(
+  drifted: number,
+  isTrap: boolean
+): number {
+  const eff = isTrap ? clamp(1 - drifted, 0.05, 0.95) : drifted;
+  return eff;
+}
 
-  // noiseLevel inversely proportional to reliability
-  const noiseLevel = clamp(0.5 * (1 - effectiveReliability), 0.05, 0.40);
+export type GeneratedSignalRow = {
+  source_family: SourceFamily;
+  visibility: "public" | "private" | "purchasable";
+  raw_estimate: number;
+  hidden_reliability: number;
+  visible_reliability_hint: number;
+  noise_level: number;
+  cost: number;
+  message_text: string;
+  is_trap: boolean;
+};
 
-  // raw_estimate: blend signal toward theta, with noise
-  // High reliability → raw_estimate close to theta
-  // Low reliability → raw_estimate is noisy
-  const rawEstimate = addNoise(
-    theta * effectiveReliability + 0.5 * (1 - effectiveReliability),
-    noiseLevel
+function buildSignal(params: {
+  regime: Regime;
+  theta: number;
+  driftSeed: number;
+  family: SourceFamily;
+  visibility: GeneratedSignalRow["visibility"];
+  isTrap: boolean;
+  cost?: number;
+  messageOverride?: string;
+}): GeneratedSignalRow {
+  const { regime, theta, driftSeed, family, visibility, isTrap } = params;
+  const drifted = driftedReliability(regime, family, driftSeed);
+  const hidden = effectiveReliability(drifted, isTrap);
+  const noise_level = clamp(0.5 * (1 - hidden), 0.05, 0.4);
+  const raw_estimate = clamp(
+    theta * hidden + 0.5 * (1 - hidden) + randn() * noise_level,
+    0.01,
+    0.99
   );
-
-  // visible_reliability_hint: noisy version of true reliability
-  // Higher noise (0.20 std) means simple hint-weighting is unreliable.
-  // Sharp agents who do proper Bayesian inference gain more advantage.
-  const visibleReliabilityHint = clamp(
-    driftedReliability + randn() * 0.20,
-    0.1,
-    0.95
-  );
-
-  const message = buildSignalMessage(
-    sourceFamily,
-    rawEstimate,
-    visibleReliabilityHint,
-    isTrap,
-    index
-  );
+  const visible_reliability_hint = clamp(drifted + randn() * 0.12, 0.1, 0.95);
+  const message_text =
+    params.messageOverride ??
+    `[${family}] Model estimate ${(raw_estimate * 100).toFixed(1)}% (regime-conditional).`;
 
   return {
-    round_id: roundId,
-    source_family: sourceFamily,
+    source_family: family,
     visibility,
-    raw_estimate: rawEstimate,
-    hidden_reliability: effectiveReliability,
-    visible_reliability_hint: visibleReliabilityHint,
-    noise_level: noiseLevel,
-    cost,
-    message_text: message,
+    raw_estimate,
+    hidden_reliability: hidden,
+    visible_reliability_hint,
+    noise_level,
+    cost: params.cost ?? 0,
+    message_text,
     is_trap: isTrap,
   };
 }
 
-// ============================================================
-// Build human-readable signal message
-// These are intentionally terse and analytical in tone.
-// ============================================================
-function buildSignalMessage(
-  family: SourceFamily,
-  estimate: number,
-  hint: number,
-  isTrap: boolean,
-  index: number
-): string {
-  const pct = Math.round(estimate * 100);
-  const hintStr = Math.round(hint * 100);
-
-  const prefixes: Record<SourceFamily, string[]> = {
-    trend: [
-      "Momentum analysis",
-      "Trend composite",
-      "Velocity model",
-      "Directional signal",
-    ],
-    fundamental: [
-      "Fundamental model",
-      "Structural assessment",
-      "Base-rate analysis",
-      "Factor model output",
-    ],
-    contrarian: [
-      "Sentiment reversal indicator",
-      "Contrarian composite",
-      "Crowding model",
-      "Positioning signal",
-    ],
-    insider: [
-      "Informed flow signal",
-      "Order-book asymmetry",
-      "Smart money tracker",
-      "Dark pool indicator",
-    ],
-    meta_reliability: [
-      "Source calibration report",
-      "Cross-signal consistency check",
-      "Reliability diagnostics",
-      "Signal audit",
-    ],
-  };
-
-  const prefix = prefixes[family][index % prefixes[family].length];
-
-  if (family === "meta_reliability") {
-    return `${prefix}: Cross-source agreement moderate. Reliability spread suggests ${hintStr < 55 ? "elevated" : "normal"} noise environment. Weighted consensus estimate: ${pct}%. Source confidence: ${hintStr}%.`;
-  }
-
-  return `${prefix} [${family.toUpperCase()}]: Probability estimate ${pct}%. Signal confidence: ${hintStr}%.${isTrap ? " [CONTRARIAN OVERRIDE]" : ""}`;
-}
-
-// ============================================================
-// Main: Generate all signals for a round
-// ============================================================
-export interface GeneratedSignals {
-  publicSignals: Omit<Signal, "id">[];
-  purchasableSignal: Omit<Signal, "id">;
-  privateSignalPool: Omit<Signal, "id">[]; // drawn from per agent
-}
-
 export function generateRoundSignals(
-  roundId: string,
+  _roundKey: string,
   theta: number,
   regime: Regime,
   driftSeed: number,
-  numAgents: number = 10
-): GeneratedSignals {
-  const signals: Omit<Signal, "id">[] = [];
-
-  // --- 2 public signals ---
-  // Must include conflicting sources. One should be somewhat misleading.
-  // In mean_reversion: trend is the trap (it overshoots), not contrarian.
-  // In stable_trend/shock_event: contrarian is the trap.
-  const trapFamily: SourceFamily =
-    regime === "mean_reversion" ? "trend" : "contrarian";
-  const usefulPublicFamily: SourceFamily =
-    regime === "mean_reversion" ? "contrarian" : "trend";
-
-  const publicFamilies: [SourceFamily, boolean][] = [
-    [usefulPublicFamily, false],
-    [trapFamily, true],
-  ];
-
-  for (const [i, [family, isTrap]] of publicFamilies.entries()) {
-    signals.push(
-      generateSignal(roundId, family, "public", theta, regime, driftSeed, 0, isTrap, i)
-    );
-  }
-
-  // --- 1 public meta-reliability signal ---
-  signals.push(
-    generateSignal(roundId, "meta_reliability", "public", theta, regime, driftSeed, 0, false, 0)
-  );
-
-  // --- Private signal pool: 2 per agent ---
-  // We generate a pool of N*2 signals, then distribute 2 per agent.
-  // Each agent gets one "useful" and one "noisier" signal.
-  const usefulFamilies: SourceFamily[] = ["fundamental", "insider"];
-  const noisyFamilies: SourceFamily[] = ["trend", "contrarian", "fundamental"];
-
-  const privatePool: Omit<Signal, "id">[] = [];
-
-  for (let i = 0; i < Math.max(numAgents, 5); i++) {
-    const usefulFamily = usefulFamilies[i % usefulFamilies.length];
-    const noisyFamily = noisyFamilies[i % noisyFamilies.length];
-
-    privatePool.push(
-      generateSignal(roundId, usefulFamily, "private", theta, regime, driftSeed, 0, false, i)
-    );
-    privatePool.push(
-      generateSignal(roundId, noisyFamily, "private", theta, regime, driftSeed, 0, Math.random() < 0.3, i)
-    );
-  }
-
-  // --- 1 purchasable signal ---
-  // Insider or fundamental, relatively high reliability, cost set low enough
-  // that sharp agents have positive expected value from purchasing.
-  const purchasableFamily: SourceFamily =
-    regime === "shock_event" ? "insider" : "fundamental";
-  const purchasable = generateSignal(
-    roundId,
-    purchasableFamily,
-    "purchasable",
-    theta,
+  numAgents?: number
+): {
+  publicSignals: GeneratedSignalRow[];
+  purchasableSignal: GeneratedSignalRow;
+  privateSignalPool: GeneratedSignalRow[];
+} {
+  // Public: trend, contrarian (trap), meta
+  const trend = buildSignal({
     regime,
+    theta,
     driftSeed,
-    5, // cost: 5 credits (reduced from 10 to ensure positive VoI)
-    false,
-    99
+    family: "trend",
+    visibility: "public",
+    isTrap: false,
+    messageOverride: `[trend] Momentum model points to ${(theta * 100).toFixed(0)}% zone.`,
+  });
+  const contrarian = buildSignal({
+    regime,
+    theta,
+    driftSeed,
+    family: "contrarian",
+    visibility: "public",
+    isTrap: true,
+    messageOverride: `[contrarian] Fade-trade setup — contrarian desk leans against trend.`,
+  });
+
+  const avgNoise =
+    (trend.noise_level + contrarian.noise_level) / 2 ||
+    0.15 + Math.random() * 0.1;
+  const metaRaw = clamp(0.5 + (avgNoise - 0.225) * 0.35 + randn() * 0.04, 0.01, 0.99);
+  const metaDrifted = driftedReliability(regime, "meta_reliability", driftSeed);
+  const metaHidden = effectiveReliability(metaDrifted, false);
+  const meta: GeneratedSignalRow = {
+    source_family: "meta_reliability",
+    visibility: "public",
+    raw_estimate: metaRaw,
+    hidden_reliability: metaHidden,
+    visible_reliability_hint: clamp(metaDrifted + randn() * 0.12, 0.1, 0.95),
+    noise_level: clamp(0.5 * (1 - metaHidden), 0.05, 0.4),
+    cost: 0,
+    message_text: `[meta] Cross-source dispersion elevated; confidence environment: ${(metaDrifted * 100).toFixed(0)}%.`,
+    is_trap: false,
+  };
+
+  const publicSignals = [trend, contrarian, meta];
+
+  // Private pool size
+  const poolTarget = Math.max(20, ((numAgents ?? 1) * 3) | 0);
+  const privateSignalPool: GeneratedSignalRow[] = [];
+  const poolFamilies: SourceFamily[] = [
+    "fundamental",
+    "insider",
+    "fundamental",
+    "insider",
+    "trend",
+    "contrarian",
+  ];
+  for (let i = 0; i < poolTarget; i++) {
+    const fam = poolFamilies[i % poolFamilies.length];
+    const noisy = i % 5 === 4;
+    privateSignalPool.push(
+      buildSignal({
+        regime,
+        theta,
+        driftSeed: driftSeed + i,
+        family: fam,
+        visibility: "private",
+        isTrap: noisy && fam !== "insider",
+        messageOverride: `[${fam}] Desk ${i} — conditional probability signal.`,
+      })
+    );
+  }
+
+  // Purchasable: insider in shock_event else fundamental; +8% reliability boost vs pool avg
+  const purchFamily: SourceFamily = regime === "shock_event" ? "insider" : "fundamental";
+  const poolAvgHidden =
+    privateSignalPool.reduce((a, s) => a + s.hidden_reliability, 0) /
+    Math.max(1, privateSignalPool.length);
+  const boosted = clamp(poolAvgHidden + 0.08, 0.05, 0.95);
+  const purchNoise = clamp(0.5 * (1 - boosted), 0.05, 0.35);
+  const purchRaw = clamp(
+    theta * boosted + 0.5 * (1 - boosted) + randn() * purchNoise,
+    0.01,
+    0.99
   );
-  // Purchasable signals should be meaningfully better than average
-  // Boost hidden reliability slightly
-  const boostedPurchasable = {
-    ...purchasable,
-    hidden_reliability: clamp(purchasable.hidden_reliability + 0.08, 0.1, 0.97),
+  const purchasableSignal: GeneratedSignalRow = {
+    source_family: purchFamily,
+    visibility: "purchasable",
+    raw_estimate: purchRaw,
+    hidden_reliability: boosted,
+    visible_reliability_hint: clamp(boosted + randn() * 0.08, 0.1, 0.95),
+    noise_level: purchNoise,
+    cost: 10,
+    message_text: `[${purchFamily}] Premium flow / structural read — purchasable intelligence.`,
+    is_trap: false,
   };
 
-  return {
-    publicSignals: signals,
-    purchasableSignal: boostedPurchasable,
-    privateSignalPool: privatePool,
-  };
-}
-
-// ============================================================
-// Round Validator
-// Ensures rounds are neither trivial nor random.
-// ============================================================
-export interface ValidationResult {
-  valid: boolean;
-  reasons: string[];
-  metrics: {
-    signal_spread: number; // spread of public estimates
-    useful_signal_count: number;
-    misleading_signal_count: number;
-    max_public_reliability: number;
-  };
+  return { publicSignals, purchasableSignal, privateSignalPool };
 }
 
 export function validateRound(
-  theta: number,
-  publicSignals: Omit<Signal, "id">[]
-): ValidationResult {
+  _theta: number,
+  publicSignals: Pick<
+    GeneratedSignalRow,
+    "raw_estimate" | "hidden_reliability" | "is_trap"
+  >[]
+): { valid: boolean; reasons?: string[] } {
   const reasons: string[] = [];
+  const maxRel = Math.max(...publicSignals.map((s) => s.hidden_reliability), 0);
+  if (maxRel > 0.92) reasons.push("max_public_reliability_too_high");
 
-  const estimates = publicSignals
-    .filter((s) => s.source_family !== "meta_reliability")
-    .map((s) => s.raw_estimate);
+  const anyLearnable = publicSignals.some((s) => s.hidden_reliability >= 0.55);
+  if (!anyLearnable) reasons.push("no_signal_reliable_enough");
 
+  const estimates = publicSignals.map((s) => s.raw_estimate);
   const spread = Math.max(...estimates) - Math.min(...estimates);
-  const maxReliability = Math.max(...publicSignals.map((s) => s.hidden_reliability));
-  const usefulSignals = publicSignals.filter((s) => s.hidden_reliability >= 0.55).length;
-  const misleadingSignals = publicSignals.filter(
-    (s) => s.is_trap || s.hidden_reliability < 0.35
-  ).length;
+  if (spread < 0.08) reasons.push("public_spread_too_low");
 
-  // Reject trivial rounds (public signal reveals answer directly)
-  if (maxReliability > 0.92) {
-    reasons.push("Public signal reliability too high — round is trivial");
-  }
+  const hasTrap = publicSignals.some((s) => s.is_trap);
+  if (!hasTrap) reasons.push("no_trap_signal");
 
-  // Reject random rounds (all signals are low quality)
-  if (usefulSignals === 0) {
-    reasons.push("No useful signals — round is too random");
-  }
-
-  // Require some conflict — lowered from 0.08 to 0.05 to reduce false rejections
-  // in mean_reversion regime where low-reliability signals cluster near 0.5
-  if (spread < 0.05) {
-    reasons.push("Signal spread too low — insufficient conflict between sources");
-  }
-
-  // Require at least 1 misleading signal
-  if (misleadingSignals === 0) {
-    reasons.push("No misleading signals — no traps for overconfident agents");
-  }
-
-  return {
-    valid: reasons.length === 0,
-    reasons,
-    metrics: {
-      signal_spread: spread,
-      useful_signal_count: usefulSignals,
-      misleading_signal_count: misleadingSignals,
-      max_public_reliability: maxReliability,
-    },
-  };
+  return { valid: reasons.length === 0, reasons: reasons.length ? reasons : undefined };
 }
 
-// ============================================================
-// Sample outcome given theta
-// ============================================================
 export function sampleOutcome(theta: number): number {
   return Math.random() < theta ? 1 : 0;
 }
 
-// ============================================================
-// Scoring and payouts
-// ============================================================
-
-/**
- * Compute raw score for an entry.
- * score = stake * (1 - (p - y)^2) * disciplineFactor
- *
- * disciplineFactor penalizes agents who always bet max stake
- * regardless of signal quality. For MVP, keep it simple.
- */
 export function computeRawScore(
-  p: number, // probability estimate [0.01, 0.99]
-  y: number, // outcome 0 or 1
-  stake: number,
-  overallBetFrequency: number = 1.0 // fraction of rounds this agent bets max
+  probability: number,
+  outcome: number,
+  stake: number
 ): number {
-  const brierComponent = 1 - Math.pow(p - y, 2);
-  // Discipline factor: modestly penalize agents with freq > 0.8 max-betting
-  const disciplineFactor =
-    overallBetFrequency > 0.8 ? 0.95 - (overallBetFrequency - 0.8) * 0.25 : 1.0;
-  return stake * brierComponent * disciplineFactor;
+  const y = outcome;
+  const p = probability;
+  const brierComp = 1 - Math.pow(p - y, 2);
+  return brierComp * (1 + Math.log1p(stake));
 }
 
-export interface PayoutResult {
+export function computePayouts(
+  entries: Array<{
+    id: string;
+    agent_id: string;
+    probability_estimate: number;
+    stake: number;
+    fee_paid: number;
+  }>,
+  outcome: number,
+  prize_pool: number
+): Array<{
   agent_id: string;
   entry_id: string;
   raw_score: number;
   normalized_score: number;
   payout_amount: number;
   profit_loss: number;
-}
-
-export function computePayouts(
-  entries: { id: string; agent_id: string; probability_estimate: number; stake: number; fee_paid: number }[],
-  outcome: number,
-  prizePool: number
-): PayoutResult[] {
+}> {
   if (entries.length === 0) return [];
+  const y = outcome;
+  const qualities = entries.map((e) => {
+    const q = Math.max(0.0001, 1 - Math.pow(e.probability_estimate - y, 2)) * (1 + Math.log1p(e.stake));
+    return q;
+  });
+  const sumQ = qualities.reduce((a, b) => a + b, 0);
+  const pool = prize_pool;
 
-  // Compute raw scores
-  const scored = entries.map((e) => ({
-    ...e,
-    raw_score: computeRawScore(e.probability_estimate, outcome, e.stake),
-  }));
-
-  // Only agents with positive raw score share the prize pool
-  const positiveScored = scored.filter((s) => s.raw_score > 0);
-  const totalPositiveScore = positiveScored.reduce((a, b) => a + b.raw_score, 0);
-
-  return scored.map((s) => {
-    const normalizedScore =
-      totalPositiveScore > 0 && s.raw_score > 0
-        ? s.raw_score / totalPositiveScore
-        : 0;
-
-    const payoutAmount = normalizedScore * prizePool;
-
-    // profit_loss = payout - (stake + fee)
-    const profitLoss = payoutAmount - s.stake - s.fee_paid;
-
+  return entries.map((e, i) => {
+    const normalized_score = sumQ > 0 ? qualities[i]! / sumQ : 1 / entries.length;
+    const payout_amount = pool * normalized_score;
+    const raw_score = payout_amount - e.stake;
+    const profit_loss = payout_amount - e.stake;
     return {
-      agent_id: s.agent_id,
-      entry_id: s.id,
-      raw_score: s.raw_score,
-      normalized_score: normalizedScore,
-      payout_amount: payoutAmount,
-      profit_loss: profitLoss,
+      agent_id: e.agent_id,
+      entry_id: e.id,
+      raw_score,
+      normalized_score,
+      payout_amount,
+      profit_loss,
     };
   });
 }
 
-// ============================================================
-// Regime inference helper (for agents / simulation)
-// Given observed signals, return a posterior over regimes.
-// This is what a sharp agent would compute.
-// ============================================================
 export function inferRegimePosterior(
-  signals: { source_family: SourceFamily; raw_estimate: number; visible_reliability_hint: number }[]
+  observed: Pick<GeneratedSignalRow, "source_family" | "visible_reliability_hint">[]
 ): Record<Regime, number> {
   const regimes: Regime[] = ["stable_trend", "mean_reversion", "shock_event"];
-  const logLikelihoods: Record<Regime, number> = {
-    stable_trend: Math.log(REGIME_PRIORS.stable_trend),
-    mean_reversion: Math.log(REGIME_PRIORS.mean_reversion),
-    shock_event: Math.log(REGIME_PRIORS.shock_event),
+  const logLik: Record<Regime, number> = {
+    stable_trend: 0,
+    mean_reversion: 0,
+    shock_event: 0,
   };
 
-  for (const signal of signals) {
-    for (const regime of regimes) {
-      const baseRel = REGIME_SOURCE_RELIABILITY[regime][signal.source_family];
-      // Signal reliability hint informs how well it matches the regime
-      const matchScore = 1 - Math.abs(signal.visible_reliability_hint - baseRel);
-      logLikelihoods[regime] += Math.log(Math.max(matchScore, 0.01));
+  for (const regime of regimes) {
+    let ll = Math.log(REGIME_PRIORS[regime]);
+    for (const sig of observed) {
+      const fam = sig.source_family as SourceFamily;
+      const baseRel = REGIME_SOURCE_RELIABILITY[regime][fam] ?? 0.5;
+      const matchScore = Math.max(0.01, 1 - Math.abs(sig.visible_reliability_hint - baseRel));
+      ll += Math.log(matchScore);
     }
+    logLik[regime] = ll;
   }
 
-  // Softmax over log likelihoods
-  const maxLL = Math.max(...Object.values(logLikelihoods));
-  const exps: Record<Regime, number> = {} as any;
-  let sum = 0;
-  for (const regime of regimes) {
-    exps[regime] = Math.exp(logLikelihoods[regime] - maxLL);
-    sum += exps[regime];
-  }
-
-  const posterior: Record<Regime, number> = {} as any;
-  for (const regime of regimes) {
-    posterior[regime] = exps[regime] / sum;
-  }
+  const maxLL = Math.max(logLik.stable_trend, logLik.mean_reversion, logLik.shock_event);
+  const expSum = regimes.reduce((a, r) => a + Math.exp(logLik[r] - maxLL), 0);
+  const posterior: Record<Regime, number> = {
+    stable_trend: Math.exp(logLik.stable_trend - maxLL) / expSum,
+    mean_reversion: Math.exp(logLik.mean_reversion - maxLL) / expSum,
+    shock_event: Math.exp(logLik.shock_event - maxLL) / expSum,
+  };
   return posterior;
 }
 
-/**
- * Given regime posterior and signals, compute a Bayesian-weighted
- * probability estimate. This is the "sharp agent" strategy.
- */
 export function computeSharpEstimate(
-  signals: { source_family: SourceFamily; raw_estimate: number; visible_reliability_hint: number }[],
+  signals: Pick<
+    GeneratedSignalRow,
+    "source_family" | "raw_estimate" | "visible_reliability_hint"
+  >[],
   regimePosterior: Record<Regime, number>
 ): number {
-  const regimes: Regime[] = ["stable_trend", "mean_reversion", "shock_event"];
-  let weightedSum = 0;
-  let totalWeight = 0;
-
-  for (const signal of signals) {
-    // Expected reliability of this signal given regime posterior
-    let expectedReliability = 0;
-    for (const regime of regimes) {
-      expectedReliability +=
-        regimePosterior[regime] * REGIME_SOURCE_RELIABILITY[regime][signal.source_family];
+  let num = 0;
+  let den = 0;
+  for (const s of signals) {
+    const fam = s.source_family as SourceFamily;
+    let expectedRel = 0;
+    for (const r of ["stable_trend", "mean_reversion", "shock_event"] as Regime[]) {
+      expectedRel +=
+        regimePosterior[r] * (REGIME_SOURCE_RELIABILITY[r][fam] ?? 0.5);
     }
-
-    // Weight by expected reliability
-    weightedSum += expectedReliability * signal.raw_estimate;
-    totalWeight += expectedReliability;
+    const w = Math.max(0.05, expectedRel * (0.5 + s.visible_reliability_hint));
+    num += s.raw_estimate * w;
+    den += w;
   }
-
-  if (totalWeight === 0) return 0.5;
-  return clamp(weightedSum / totalWeight, 0.01, 0.99);
+  return den > 0 ? num / den : 0.5;
 }
-
-export { REGIME_SOURCE_RELIABILITY, REGIME_PRIORS };

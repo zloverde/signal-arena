@@ -21,8 +21,8 @@ import {
   assignPrivateSignals,
   getPayoutsForRound,
   db,
-} from "../../../../lib/db/client";
-import { authenticateAgent } from "../../../../lib/auth";
+} from "@/lib/db/client";
+import { authenticateAgent } from "@/lib/auth";
 
 function stripHidden(signal: any) {
   const { hidden_reliability, is_trap, ...safe } = signal;
@@ -34,9 +34,10 @@ function stripHidden(signal: any) {
 // ============================================================
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const round = await getRoundById(params.id);
+  const { id } = await params;
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }
@@ -94,14 +95,15 @@ export async function GET(
 // ============================================================
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const url = new URL(req.url);
   const action = url.pathname.split("/").pop();
 
-  if (action === "join") return handleJoin(req, params.id);
-  if (action === "submit") return handleSubmit(req, params.id);
-  if (action === "purchase-signal") return handlePurchase(req, params.id);
+  if (action === "join") return handleJoin(req, id);
+  if (action === "submit") return handleSubmit(req, id);
+  if (action === "purchase-signal") return handlePurchase(req, id);
 
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });
 }

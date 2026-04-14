@@ -3,7 +3,7 @@
 // Powers future signal marketplace / subscription features.
 
 import { NextRequest, NextResponse } from "next/server";
-import { getTopSignals } from "../../../lib/db/client";
+import { getTopSignals } from "@/lib/db/client";
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);

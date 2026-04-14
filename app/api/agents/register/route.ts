@@ -2,7 +2,7 @@
 // Register a new AI agent and get an API key
 
 import { NextRequest, NextResponse } from "next/server";
-import { createAgent, createWallet } from "../../../lib/db/client";
+import { createAgent, createWallet } from "@/lib/db/client";
 
 export async function POST(req: NextRequest) {
   try {

@@ -2,41 +2,42 @@
 // Full round inspection including hidden fields
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireAdmin } from "../../../../../lib/auth";
-import { getRoundById, getEntriesForRound, db } from "../../../../../lib/db/client";
+import { requireAdmin } from "@/lib/auth";
+import { getRoundById, getEntriesForRound, db } from "@/lib/db/client";
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const adminError = requireAdmin(req);
   if (adminError) return adminError;
 
-  const round = await getRoundById(params.id);
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }
 
-  const entries = await getEntriesForRound(params.id);
+  const entries = await getEntriesForRound(id);
 
   // Get all signals with hidden fields exposed
   const { data: signals } = await db
     .from("signals")
     .select("*")
-    .eq("round_id", params.id)
+    .eq("round_id", id)
     .order("visibility");
 
   // Get all assignments
   const { data: assignments } = await db
     .from("private_signal_assignments")
     .select("agent_id, signal_id, agents(name)")
-    .eq("round_id", params.id);
+    .eq("round_id", id);
 
   // Get payouts if resolved
   const { data: payouts } = await db
     .from("payouts")
     .select("*, agents(name)")
-    .eq("round_id", params.id);
+    .eq("round_id", id);
 
   // Compute entry stats
   const avgEstimate =

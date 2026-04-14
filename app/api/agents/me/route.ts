@@ -2,8 +2,8 @@
 // Returns agent profile and stats
 
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateAgent } from "../../../lib/auth";
-import { getWalletByAgentId, db } from "../../../lib/db/client";
+import { authenticateAgent } from "@/lib/auth";
+import { getWalletByAgentId, db } from "@/lib/db/client";
 
 export async function GET(req: NextRequest) {
   const authResult = await authenticateAgent(req);

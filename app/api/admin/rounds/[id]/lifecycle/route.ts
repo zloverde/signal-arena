@@ -2,7 +2,7 @@
 // Admin controls: open, lock, resolve round
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireAdmin } from "../../../../../lib/auth";
+import { requireAdmin } from "@/lib/auth";
 import {
   getRoundById,
   updateRoundStatus,
@@ -12,20 +12,21 @@ import {
   updateLeaderboard,
   logAdminEvent,
   db,
-} from "../../../../../lib/db/client";
-import { computePayouts, sampleOutcome } from "../../../../../lib/engine/signal-engine";
+} from "@/lib/db/client";
+import { computePayouts, sampleOutcome } from "@/lib/engine/signal-engine";
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const adminError = requireAdmin(req);
   if (adminError) return adminError;
 
   const body = await req.json();
   const { action, force_outcome } = body;
 
-  const round = await getRoundById(params.id);
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }
@@ -37,8 +38,8 @@ export async function POST(
         { status: 400 }
       );
     }
-    await updateRoundStatus(params.id, "open");
-    await logAdminEvent("round_opened", params.id);
+    await updateRoundStatus(id, "open");
+    await logAdminEvent("round_opened", id);
     return NextResponse.json({ message: "Round opened", status: "open" });
   }
 
@@ -49,10 +50,10 @@ export async function POST(
         { status: 400 }
       );
     }
-    await updateRoundStatus(params.id, "locked");
-    await logAdminEvent("round_locked", params.id);
+    await updateRoundStatus(id, "locked");
+    await logAdminEvent("round_locked", id);
 
-    const entries = await getEntriesForRound(params.id);
+    const entries = await getEntriesForRound(id);
     return NextResponse.json({
       message: "Round locked",
       status: "locked",
@@ -76,13 +77,13 @@ export async function POST(
         : sampleOutcome(round.theta);
 
     // Update round
-    await updateRoundStatus(params.id, "resolved", outcome);
+    await updateRoundStatus(id, "resolved", outcome);
 
     // Record outcome
-    await recordOutcome(params.id, outcome, round.theta, round.regime);
+    await recordOutcome(id, outcome, round.theta, round.regime);
 
     // Get all entries
-    const entries = await getEntriesForRound(params.id);
+    const entries = await getEntriesForRound(id);
 
     // Compute payouts
     const payoutResults = computePayouts(entries, outcome, round.prize_pool);
@@ -91,7 +92,7 @@ export async function POST(
     if (payoutResults.length > 0) {
       await insertPayouts(
         payoutResults.map((p) => ({
-          round_id: params.id,
+          round_id: id,
           agent_id: p.agent_id,
           entry_id: p.entry_id,
           raw_score: p.raw_score,
@@ -127,12 +128,12 @@ export async function POST(
 
         // Update agent stats
         const won = payout.profit_loss > 0 ? 1 : 0;
-        await db.rpc("increment_agent_stats", {
+        const { error: rpcError } = await db.rpc("increment_agent_stats", {
           p_agent_id: payout.agent_id,
           p_rounds: 1,
           p_wins: won,
-        }).catch(async () => {
-          // Fallback if RPC not available
+        });
+        if (rpcError) {
           const { data: agent } = await db
             .from("agents")
             .select("total_rounds, total_wins, reputation_score")
@@ -149,13 +150,13 @@ export async function POST(
               })
               .eq("id", payout.agent_id);
           }
-        });
+        }
 
         await updateLeaderboard(payout.agent_id);
       }
     }
 
-    await logAdminEvent("round_resolved", params.id, undefined, {
+    await logAdminEvent("round_resolved", id, undefined, {
       outcome,
       theta: round.theta,
       regime: round.regime,
@@ -175,8 +176,8 @@ export async function POST(
   }
 
   if (action === "cancel") {
-    await updateRoundStatus(params.id, "cancelled");
-    await logAdminEvent("round_cancelled", params.id);
+    await updateRoundStatus(id, "cancelled");
+    await logAdminEvent("round_cancelled", id);
     return NextResponse.json({ message: "Round cancelled" });
   }
 

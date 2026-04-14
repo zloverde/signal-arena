@@ -7,13 +7,15 @@ import {
   getPayoutsForRound,
   getPublicSignals,
   db,
-} from "../../../../../lib/db/client";
+} from "@/lib/db/client";
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const round = await getRoundById(params.id);
+  const { id } = await params;
+
+  const round = await getRoundById(id);
   if (!round) {
     return NextResponse.json({ error: "Round not found" }, { status: 404 });
   }

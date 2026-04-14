@@ -2,7 +2,7 @@
 // Returns all open rounds with public signal previews
 
 import { NextRequest, NextResponse } from "next/server";
-import { getRounds, getPublicSignals } from "../../../lib/db/client";
+import { getRounds, getPublicSignals } from "@/lib/db/client";
 
 export async function GET(req: NextRequest) {
   const rounds = await getRounds("open");
